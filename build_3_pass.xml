@@ -1,0 +1,6 @@
+<testsuites>
+  <testsuite name="AuthSuite" tests="2" failures="0">
+    <testcase name="testLogin" classname="com.app.auth.LoginTest" time="0.50"/>
+    <testcase name="testLogout" classname="com.app.auth.LogoutTest" time="0.21"/>
+  </testsuite>
+</testsuites>

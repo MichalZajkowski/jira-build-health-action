@@ -1,0 +1,10 @@
+<testsuites>
+  <testsuite name="AuthSuite" tests="2" failures="1">
+    <testcase name="testLogin" classname="com.app.auth.LoginTest" time="1.20">
+      <failure message="TimeoutException: Server did not respond in 1000ms">
+        Traceback (most recent call last)...
+      </failure>
+    </testcase>
+    <testcase name="testLogout" classname="com.app.auth.LogoutTest" time="0.22"/>
+  </testsuite>
+</testsuites>

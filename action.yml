@@ -1,0 +1,31 @@
+name: 'Jira Build Health Analyzer'
+description: 'Analyzes build result XML files and uploads a summary to a Jira issue.'
+inputs:
+  xml_files:
+    description: 'Glob pattern or list of XML files'
+    required: true
+  jira_issue:
+    description: 'Jira Issue Key'
+    required: true
+  jira_domain:
+    description: 'Jira Domain'
+    required: true
+  jira_email:
+    description: 'Jira Email'
+    required: true
+  jira_token:
+    description: 'Jira API Token'
+    required: true
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.xml_files }}
+    - '--issue'
+    - ${{ inputs.jira_issue }}
+    - '--domain'
+    - ${{ inputs.jira_domain }}
+    - '--email'
+    - ${{ inputs.jira_email }}
+    - '--token'
+    - ${{ inputs.jira_token }}
