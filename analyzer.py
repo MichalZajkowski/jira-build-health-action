@@ -1,157 +1,172 @@
 import argparse
 import xml.etree.ElementTree as ET
 import json
+import sys
 import os
 import requests
+import glob  # <--- NOWOŚĆ: Biblioteka do obsługi gwiazdek
 from requests.auth import HTTPBasicAuth
-from collections import defaultdict
+
+# Stałe
+PROPERTY_KEY = "build_health_data"
+STARTING_SCORE = 100
+PENALTY_CURRENT_FAILURE = 20
+PENALTY_FLAKY_TEST = 10
+THRESHOLD_STABLE = 80
+THRESHOLD_UNSTABLE = 50
+
+
+class TestResult:
+    def __init__(self, name, status, message="", duration=0.0):
+        self.name = name
+        self.status = status
+        self.message = message
+        self.duration = duration
+
 
 class BuildHealthAgent:
-    """
-    Analizuje wyniki testów w formacie JUnit XML, oblicza wskaźniki kondycji
-    i przesyła podsumowanie do Jiry.
-    """
-    FAILURE_PENALTY = 10
-
     def __init__(self):
-        self.score = 100
+        self.history = {}
+        self.latest_results = {}
         self.total_duration = 0.0
-        self.current_failures = []
-        self.test_history = defaultdict(list)
-        self.last_status = {}
 
-    def process_builds(self, xml_files):
-        """
-        Przetwarza listę plików XML z wynikami testów.
+    def parse_xml_file(self, file_path):
+        results = []
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+        except Exception as e:
+            print(f"Warning: Nie można sparsować {file_path}: {e}", file=sys.stderr)
+            return []
 
-        Args:
-            xml_files (list): Lista ścieżek do plików XML.
-        """
-        print(f"Processing {len(xml_files)} XML file(s)...")
-        for file_path in xml_files:
-            try:
-                tree = ET.parse(file_path)
-                root = tree.getroot()
+        suites = root.findall('testsuite') if root.tag == 'testsuites' else [root]
+        for suite in suites:
+            for case in suite.findall('testcase'):
+                full_name = f"{case.get('classname', 'unknown')}.{case.get('name', 'unknown')}"
+                duration = float(case.get('time', 0.0))
+                status = "PASS"
+                message = ""
 
-                # Sumaryczny czas wykonania z <testsuite>
-                duration = float(root.get('time', 0))
-                self.total_duration += duration
+                if case.find('failure') is not None:
+                    status = "FAIL"
+                    fail_node = case.find('failure')
+                    message = fail_node.get('message', '') or fail_node.text or "Unknown failure"
+                elif case.find('error') is not None:
+                    status = "FAIL"
+                    err_node = case.find('error')
+                    message = err_node.get('message', '') or err_node.text or "Unknown error"
+                elif case.find('skipped') is not None:
+                    status = "SKIP"
 
-                for testcase in root.findall('testcase'):
-                    self._process_testcase(testcase)
+                results.append(TestResult(full_name, status, message, duration))
+        return results
 
-            except ET.ParseError as e:
-                print(f"Error parsing XML file {file_path}: {e}")
-            except FileNotFoundError:
-                print(f"Error: XML file not found at {file_path}")
+    def process_builds(self, file_patterns):
+        # --- POPRAWKA: Rozwijanie gwiazdek (Globbing) ---
+        expanded_files = []
+        for pattern in file_patterns:
+            # Glob expanduje np. "build_*.xml" na ["build_1.xml", "build_2.xml"]
+            found = glob.glob(pattern)
+            if not found:
+                # Jeśli plik podany wprost (bez gwiazdki) nie istnieje, to ostrzeżenie
+                print(f"Warning: File pattern returned no files: {pattern}")
+            expanded_files.extend(found)
 
-        print("Finished processing build files.")
+        # Sortowanie, żeby kolejność historii była zachowana (1, 2, 3)
+        expanded_files.sort()
 
-    def _process_testcase(self, testcase):
-        """Przetwarza pojedynczy element <testcase>."""
-        name = testcase.get('name')
-        status = 'PASS'
-        error_message = ''
+        if not expanded_files:
+            print("Error: No valid XML files found to process.")
+            # Nie wychodzimy exit(1), żeby spróbować wysłać chociaż status 0 do Jiry
+            return
 
-        failure = testcase.find('failure')
-        if failure is not None:
-            status = 'FAIL'
-            self.score -= self.FAILURE_PENALTY
-            error_message = failure.get('message', 'No message')
-            self.current_failures.append({"test": name, "error": error_message})
+        print(f"Processing {len(expanded_files)} XML file(s): {expanded_files}")
 
-        error = testcase.find('error')
-        if error is not None:
-            status = 'FAIL'
-            if status != 'FAIL': # Unikaj podwójnej kary
-                 self.score -= self.FAILURE_PENALTY
-                 self.current_failures.append({"test": name, "error": error_message})
-            error_message = error.get('message', 'No message')
+        for idx, file_path in enumerate(expanded_files):
+            results = self.parse_xml_file(file_path)
+            is_latest = (idx == len(expanded_files) - 1)
 
+            if is_latest:
+                self.total_duration = sum(r.duration for r in results)
 
-        if testcase.find('skipped') is not None:
-            status = 'SKIP'
+            for result in results:
+                if result.name not in self.history: self.history[result.name] = []
+                self.history[result.name].append(result.status)
+                if is_latest: self.latest_results[result.name] = result
 
-        self.test_history[name].append(status)
-        self.last_status[name] = status
+    def generate_payload(self):
+        current_failures = [r for r in self.latest_results.values() if r.status == "FAIL"]
 
-    def _identify_flaky_tests(self):
-        """
-        Identyfikuje testy, które w przeszłości kończyły się niepowodzeniem,
-        ale w ostatnim przebiegu zakończyły się sukcesem.
-        """
         flaky_tests = []
-        for name, history in self.test_history.items():
-            is_flaky = 'FAIL' in history and self.last_status.get(name) == 'PASS'
-            if is_flaky:
+        for name, statuses in self.history.items():
+            if len(statuses) >= 2 and statuses[-1] == "PASS" and "FAIL" in statuses[:-1]:
                 flaky_tests.append(name)
-        return flaky_tests
+
+        score = max(0, STARTING_SCORE - (len(current_failures) * PENALTY_CURRENT_FAILURE) - (
+                    len(flaky_tests) * PENALTY_FLAKY_TEST))
+
+        status = "Stable"
+        if score < THRESHOLD_UNSTABLE:
+            status = "Critical"
+        elif score < THRESHOLD_STABLE:
+            status = "Unstable"
+
+        formatted_failures = []
+        for fail in current_failures:
+            clean_msg = (fail.message or "").strip().replace("\n", " ")
+            formatted_failures.append({
+                "test": fail.name,
+                "error": (clean_msg[:97] + "...") if len(clean_msg) > 100 else clean_msg
+            })
+
+        return {
+            "summary": {"score": score, "status": status, "totalDuration": round(self.total_duration, 2)},
+            "flakyTests": flaky_tests,
+            "currentFailures": formatted_failures
+        }
 
     def upload_to_jira(self, issue_key, domain, email, token):
-        """
-        Generuje raport w formacie JSON i wysyła go do Jiry jako Entity Property.
-        """
-        flaky_tests = self._identify_flaky_tests()
-        
-        # Ogranicz wynik do minimum 0
-        final_score = max(0, self.score)
+        # --- ZABEZPIECZENIE URL ---
+        # Usuwamy https:// jeśli użytkownik wpisał to w Secrecie
+        clean_domain = domain.replace("https://", "").replace("/", "")
 
-        summary_status = "FAIL" if self.current_failures else "PASS"
-
-        payload = {
-            "summary": {
-                "score": final_score,
-                "status": summary_status,
-                "totalDuration": round(self.total_duration, 4)
-            },
-            "flakyTests": flaky_tests,
-            "currentFailures": self.current_failures
-        }
-
-        print("Generated JSON Payload:")
-        print(json.dumps(payload, indent=2))
-
-        url = f"https://{domain}/rest/api/3/issue/{issue_key}/properties/build_health_data"
-        auth = HTTPBasicAuth(email, token)
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
+        url = f"https://{clean_domain}/rest/api/3/issue/{issue_key}/properties/{PROPERTY_KEY}"
 
         print(f"Uploading data to Jira issue {issue_key}...")
+
         try:
             response = requests.put(
                 url,
-                data=json.dumps(payload),
-                headers=headers,
-                auth=auth,
-                timeout=30
+                json=self.generate_payload(),
+                auth=HTTPBasicAuth(email, token),
+                headers={"Accept": "application/json", "Content-Type": "application/json"}
             )
-            response.raise_for_status()
-            print("Successfully uploaded build health data to Jira.")
-            print(f"Status Code: {response.status_code}")
 
-        except requests.exceptions.RequestException as e:
-            print(f"Error uploading to Jira: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response Status: {e.response.status_code}")
-                print(f"Response Body: {e.response.text}")
-            # Zakończ z błędem, aby zatrzymać GitHub Action
-            exit(1)
+            if response.status_code in [200, 201, 204]:
+                print(f"✅ SUCCESS! Data saved to {issue_key}.")
+            else:
+                print(f"Error uploading to Jira: {response.status_code}")
+                print(f"Response Body: {response.text}")
+                sys.exit(1)  # Fail the action if Jira upload fails
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            sys.exit(1)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze JUnit XML files and upload results to Jira.")
-    parser.add_argument('xml_files', nargs='+', help='Glob pattern or list of XML files')
-    parser.add_argument('--issue', required=True, help='Jira Issue Key (e.g., DEV-1)')
-    parser.add_argument('--domain', required=True, help='Jira Domain (e.g., your-domain.atlassian.net)')
-    parser.add_argument('--email', required=True, help='Your Jira account email')
-    parser.add_argument('--token', required=True, help='Your Jira API Token')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('xml_files', nargs='+', help='XML files or glob patterns')
+    parser.add_argument('--issue', required=True)
+    parser.add_argument('--domain', required=True)
+    parser.add_argument('--email', required=True)
+    parser.add_argument('--token', required=True)
+
     args = parser.parse_args()
 
     agent = BuildHealthAgent()
     agent.process_builds(args.xml_files)
     agent.upload_to_jira(args.issue, args.domain, args.email, args.token)
+
 
 if __name__ == "__main__":
     main()
