@@ -1,0 +1,17 @@
+name: Test Build Health Monitor
+on: [push, workflow_dispatch]
+jobs:
+  test-agent:
+    runs-on: ubuntu-latest
+    name: Test Agent
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run Build Health Agent
+        uses: ./ 
+        with:
+          xml_files: 'build_*.xml'
+          jira_issue: 'DEV-1'
+          jira_domain: ${{ secrets.JIRA_DOMAIN }}
+          jira_email: ${{ secrets.JIRA_EMAIL }}
+          jira_token: ${{ secrets.JIRA_TOKEN }}
